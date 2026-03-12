@@ -237,8 +237,69 @@ python3 tools/export_ultralytics_pt.py \
 - `--pt`：输入 `.pt` 模型路径
 - `--out-dir`：导出目录（默认 `models`）
 - `--imgsz`：导出推理尺寸（默认 `640`）
-- `--data`：INT8 校准数据配置（建议提供，提升量化质量）
+- `--data`：INT8 校准数据配置（必填，需为真实存在的 yaml 路径）
 - `--device`：可选，导出设备（如 `cpu`）
+
+## 评估三种导出结果（验证导出效果）
+
+本仓库提供脚本：`tools/eval_exported_models.py`，用于对三种导出模型做统一评估并输出对比结果。
+
+### 评估脚本依赖（Python）
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install ultralytics tensorflow
+```
+
+### 方法一：自动发现模型（推荐）
+
+当你已经通过导出脚本生成了：
+
+- `models/<stem>_armnn_int8.tflite`
+- `models/<stem>_tflite_cpu_int8.tflite`
+- `models/<stem>_tflite_gpu_fp16.tflite`（或 fp32）
+
+可直接运行：
+
+```bash
+python3 tools/eval_exported_models.py \
+  --data /abs/path/data.yaml \
+  --out-dir models \
+  --stem yolo26n \
+  --imgsz 640 \
+  --split val \
+  --device cpu \
+  --batch 1 \
+  --save-json reports/eval_three_models.json
+```
+
+### 方法二：手动指定三个模型路径
+
+```bash
+python3 tools/eval_exported_models.py \
+  --data /abs/path/data.yaml \
+  --armnn-model /abs/path/yolo26n_armnn_int8.tflite \
+  --tflite-cpu-model /abs/path/yolo26n_tflite_cpu_int8.tflite \
+  --tflite-gpu-model /abs/path/yolo26n_tflite_gpu_fp16.tflite \
+  --imgsz 640 \
+  --split val \
+  --device cpu
+```
+
+### 输出内容
+
+脚本会打印并可选保存以下指标：
+
+- `mAP50`
+- `mAP50-95`
+- `precision`
+- `recall`
+- `speed(ms)` 与估算 `FPS`
+
+用于快速验证：
+
+- 导出后精度是否明显下降
+- 三种导出结果在同一数据集上的速度差异
 
 ## 常用 Make 命令
 
