@@ -63,7 +63,8 @@ def evaluate_one(
 
     start = time.perf_counter()
     try:
-        model = YOLO(str(model_path))
+        # Explicitly set task to avoid exported models being auto-detected as "detect".
+        model = YOLO(str(model_path), task=task)
         metrics = model.val(
             data=str(data_yaml),
             split=split,
@@ -90,6 +91,13 @@ def evaluate_one(
             "fps_estimate": None,
             "val_seconds": elapsed,
         }
+
+        if task == "segment" and result["seg_mAP50"] is None:
+            result["warning"] = (
+                "seg metrics unavailable. Possible causes: model loaded as detect, "
+                "dataset yaml/labels are detection-only, or this exported backend/version "
+                "does not expose mask predictions for validation."
+            )
 
         # Ultralytics speed values are usually in ms/image.
         try:
@@ -147,6 +155,8 @@ def print_table(results: list[Dict[str, Any]]) -> None:
             f"{_fmt(r.get('fps_estimate'), 2):>8}  "
             f"{r['model']}"
         )
+        if r.get("warning"):
+            print(f"{'':<14} {'':<8} warn: {r['warning']}")
 
     ok_count = sum(1 for r in results if r.get("ok"))
     print(f"\nFinished: {ok_count}/{len(results)} models evaluated successfully.")
