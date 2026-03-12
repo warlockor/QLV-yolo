@@ -24,6 +24,7 @@ struct Detection
     cv::Rect box;
     int classId;
     float score;
+    cv::Mat mask;
 };
 
 struct LetterboxResult
@@ -32,6 +33,8 @@ struct LetterboxResult
     float scale = 1.0f;
     int padW = 0;
     int padH = 0;
+    int resizedW = 0;
+    int resizedH = 0;
 };
 
 float Sigmoid(float x)
@@ -57,7 +60,7 @@ LetterboxResult Letterbox(const cv::Mat& src, int dstW, int dstH)
 
     cv::Mat output;
     cv::copyMakeBorder(resized, output, top, bottom, left, right, cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
-    return {output, r, left, top};
+    return {output, r, left, top, newW, newH};
 }
 
 float IoU(const cv::Rect& a, const cv::Rect& b)
@@ -119,10 +122,23 @@ T Quantize(float realValue, float scale, int32_t zeroPoint)
     return static_cast<T>(std::max(lo, std::min(hi, q)));
 }
 
+cv::Mat SigmoidMat(const cv::Mat& src)
+{
+    cv::Mat expNeg;
+    cv::exp(-src, expNeg);
+    return 1.0f / (1.0f + expNeg);
+}
+
 void DrawDetections(cv::Mat& image, const std::vector<Detection>& detections)
 {
     for (const auto& d : detections)
     {
+        if (!d.mask.empty())
+        {
+            cv::Mat overlay = image.clone();
+            overlay.setTo(cv::Scalar(0, 0, 255), d.mask);
+            cv::addWeighted(overlay, 0.25, image, 0.75, 0.0, image);
+        }
         cv::rectangle(image, d.box, cv::Scalar(0, 255, 0), 2);
         const std::string text =
             "cls=" + std::to_string(d.classId) + " score=" + cv::format("%.2f", static_cast<double>(d.score));
@@ -293,80 +309,224 @@ private:
 
     std::vector<Detection> DecodeOutputs(const cv::Size& origSize, const LetterboxResult& lb) const
     {
-        std::vector<Detection> dets;
+        struct TensorData
+        {
+            std::vector<int> shape;
+            std::vector<float> data;
+        };
+
+        std::vector<TensorData> outs;
         for (int outTensorIndex : m_interpreter->outputs())
         {
             const TfLiteTensor* t = m_interpreter->tensor(outTensorIndex);
-            if (t->dims->size < 2)
+            TensorData td;
+            for (int i = 0; i < t->dims->size; ++i)
             {
-                continue;
+                td.shape.push_back(t->dims->data[i]);
             }
-            const int lastDim = t->dims->data[t->dims->size - 1];
-            if (lastDim < 6)
+            td.data = OutputToFloat(t, outTensorIndex);
+            outs.push_back(std::move(td));
+        }
+        if (outs.empty())
+        {
+            return {};
+        }
+
+        int detIdx = -1;
+        int protoIdx = -1;
+        for (size_t i = 0; i < outs.size(); ++i)
+        {
+            if (outs[i].shape.size() == 4)
             {
-                continue;
+                protoIdx = static_cast<int>(i);
             }
-
-            const std::vector<float> out = OutputToFloat(t, outTensorIndex);
-            const size_t rows = out.size() / static_cast<size_t>(lastDim);
-            for (size_t i = 0; i < rows; ++i)
+            else if (outs[i].shape.size() >= 2)
             {
-                const size_t base = i * static_cast<size_t>(lastDim);
-                const float cx = out[base + 0];
-                const float cy = out[base + 1];
-                const float w = out[base + 2];
-                const float h = out[base + 3];
-                const float obj = Sigmoid(out[base + 4]);
+                detIdx = static_cast<int>(i);
+            }
+        }
+        if (detIdx < 0)
+        {
+            return {};
+        }
 
-                int bestCls = -1;
-                float bestClsProb = 0.0f;
-                const int clsCount = std::min(m_numClasses, lastDim - 5);
-                for (int c = 0; c < clsCount; ++c)
+        const auto& det = outs[static_cast<size_t>(detIdx)];
+        size_t rows = 0;
+        size_t cols = 0;
+        bool transposed = false;
+        if (det.shape.size() == 3)
+        {
+            const size_t a = static_cast<size_t>(det.shape[1]);
+            const size_t b = static_cast<size_t>(det.shape[2]);
+            if (a >= b)
+            {
+                rows = a;
+                cols = b;
+            }
+            else
+            {
+                rows = b;
+                cols = a;
+                transposed = true;
+            }
+        }
+        else
+        {
+            cols = static_cast<size_t>(det.shape.back());
+            rows = det.data.size() / std::max<size_t>(1, cols);
+        }
+
+        auto detAt = [&](size_t r, size_t c) -> float {
+            if (!transposed)
+            {
+                return det.data[r * cols + c];
+            }
+            return det.data[c * rows + r];
+        };
+
+        int maskDim = static_cast<int>(cols) - (4 + m_numClasses);
+        bool hasObj = false;
+        if (maskDim <= 0 || maskDim > 256)
+        {
+            const int alt = static_cast<int>(cols) - (5 + m_numClasses);
+            if (alt > 0 && alt <= 256)
+            {
+                maskDim = alt;
+                hasObj = true;
+            }
+            else
+            {
+                maskDim = 0;
+            }
+        }
+        const int clsOffset = hasObj ? 5 : 4;
+        const int maskOffset = clsOffset + m_numClasses;
+
+        std::vector<cv::Mat> protoChannels;
+        int protoW = 0;
+        int protoH = 0;
+        if (protoIdx >= 0 && maskDim > 0)
+        {
+            const auto& proto = outs[static_cast<size_t>(protoIdx)];
+            if (proto.shape.size() == 4)
+            {
+                const int d1 = proto.shape[1];
+                const int d2 = proto.shape[2];
+                const int d3 = proto.shape[3];
+                bool nhwc = (d3 == maskDim);
+                if (nhwc)
                 {
-                    const float p = Sigmoid(out[base + 5 + c]);
-                    if (p > bestClsProb)
+                    protoH = d1;
+                    protoW = d2;
+                    protoChannels.assign(maskDim, cv::Mat(protoH, protoW, CV_32F));
+                    for (int y = 0; y < protoH; ++y)
                     {
-                        bestClsProb = p;
-                        bestCls = c;
+                        for (int x = 0; x < protoW; ++x)
+                        {
+                            for (int c = 0; c < maskDim; ++c)
+                            {
+                                const size_t idx = (static_cast<size_t>(y) * protoW + x) * maskDim + c;
+                                protoChannels[c].at<float>(y, x) = proto.data[idx];
+                            }
+                        }
                     }
                 }
-
-                const float score = obj * bestClsProb;
-                if (bestCls < 0 || score < m_confThresh)
+                else if (d1 == maskDim)
                 {
-                    continue;
+                    protoH = d2;
+                    protoW = d3;
+                    protoChannels.assign(maskDim, cv::Mat(protoH, protoW, CV_32F));
+                    for (int c = 0; c < maskDim; ++c)
+                    {
+                        for (int y = 0; y < protoH; ++y)
+                        {
+                            for (int x = 0; x < protoW; ++x)
+                            {
+                                const size_t idx =
+                                    (static_cast<size_t>(c) * protoH + static_cast<size_t>(y)) * protoW + x;
+                                protoChannels[c].at<float>(y, x) = proto.data[idx];
+                            }
+                        }
+                    }
                 }
+            }
+        }
 
-                float x1 = cx - w * 0.5f;
-                float y1 = cy - h * 0.5f;
-                float x2 = cx + w * 0.5f;
-                float y2 = cy + h * 0.5f;
-                if (x2 <= 2.0f && y2 <= 2.0f)
+        std::vector<Detection> dets;
+        std::vector<std::vector<float>> coeffs;
+        for (size_t i = 0; i < rows; ++i)
+        {
+            const float cx = detAt(i, 0);
+            const float cy = detAt(i, 1);
+            const float w = detAt(i, 2);
+            const float h = detAt(i, 3);
+            const float obj = hasObj ? Sigmoid(detAt(i, 4)) : 1.0f;
+
+            int bestCls = -1;
+            float bestClsProb = 0.0f;
+            for (int c = 0; c < m_numClasses && (clsOffset + c) < static_cast<int>(cols); ++c)
+            {
+                const float p = Sigmoid(detAt(i, static_cast<size_t>(clsOffset + c)));
+                if (p > bestClsProb)
                 {
-                    x1 *= static_cast<float>(m_inputW);
-                    x2 *= static_cast<float>(m_inputW);
-                    y1 *= static_cast<float>(m_inputH);
-                    y2 *= static_cast<float>(m_inputH);
+                    bestClsProb = p;
+                    bestCls = c;
                 }
+            }
+            const float score = obj * bestClsProb;
+            if (bestCls < 0 || score < m_confThresh)
+            {
+                continue;
+            }
 
-                x1 = (x1 - static_cast<float>(lb.padW)) / lb.scale;
-                x2 = (x2 - static_cast<float>(lb.padW)) / lb.scale;
-                y1 = (y1 - static_cast<float>(lb.padH)) / lb.scale;
-                y2 = (y2 - static_cast<float>(lb.padH)) / lb.scale;
+            float x1 = cx - w * 0.5f;
+            float y1 = cy - h * 0.5f;
+            float x2 = cx + w * 0.5f;
+            float y2 = cy + h * 0.5f;
+            if (x2 <= 2.0f && y2 <= 2.0f)
+            {
+                x1 *= static_cast<float>(m_inputW);
+                x2 *= static_cast<float>(m_inputW);
+                y1 *= static_cast<float>(m_inputH);
+                y2 *= static_cast<float>(m_inputH);
+            }
+            x1 = (x1 - static_cast<float>(lb.padW)) / lb.scale;
+            x2 = (x2 - static_cast<float>(lb.padW)) / lb.scale;
+            y1 = (y1 - static_cast<float>(lb.padH)) / lb.scale;
+            y2 = (y2 - static_cast<float>(lb.padH)) / lb.scale;
 
-                x1 = std::max(0.0f, std::min(x1, static_cast<float>(origSize.width - 1)));
-                y1 = std::max(0.0f, std::min(y1, static_cast<float>(origSize.height - 1)));
-                x2 = std::max(0.0f, std::min(x2, static_cast<float>(origSize.width - 1)));
-                y2 = std::max(0.0f, std::min(y2, static_cast<float>(origSize.height - 1)));
+            x1 = std::max(0.0f, std::min(x1, static_cast<float>(origSize.width - 1)));
+            y1 = std::max(0.0f, std::min(y1, static_cast<float>(origSize.height - 1)));
+            x2 = std::max(0.0f, std::min(x2, static_cast<float>(origSize.width - 1)));
+            y2 = std::max(0.0f, std::min(y2, static_cast<float>(origSize.height - 1)));
 
-                const int bx = static_cast<int>(std::round(x1));
-                const int by = static_cast<int>(std::round(y1));
-                const int bw = static_cast<int>(std::round(std::max(0.0f, x2 - x1)));
-                const int bh = static_cast<int>(std::round(std::max(0.0f, y2 - y1)));
-                if (bw > 1 && bh > 1)
+            const int bx = static_cast<int>(std::round(x1));
+            const int by = static_cast<int>(std::round(y1));
+            const int bw = static_cast<int>(std::round(std::max(0.0f, x2 - x1)));
+            const int bh = static_cast<int>(std::round(std::max(0.0f, y2 - y1)));
+            if (bw <= 1 || bh <= 1)
+            {
+                continue;
+            }
+
+            Detection d;
+            d.box = cv::Rect(bx, by, bw, bh);
+            d.classId = bestCls;
+            d.score = score;
+            dets.push_back(d);
+
+            if (!protoChannels.empty() && maskDim > 0)
+            {
+                std::vector<float> cf(maskDim, 0.0f);
+                for (int k = 0; k < maskDim && (maskOffset + k) < static_cast<int>(cols); ++k)
                 {
-                    dets.push_back({cv::Rect(bx, by, bw, bh), bestCls, score});
+                    cf[k] = detAt(i, static_cast<size_t>(maskOffset + k));
                 }
+                coeffs.push_back(std::move(cf));
+            }
+            else
+            {
+                coeffs.emplace_back();
             }
         }
 
@@ -375,7 +535,27 @@ private:
         filtered.reserve(keep.size());
         for (int i : keep)
         {
-            filtered.push_back(dets[i]);
+            Detection d = dets[i];
+            if (!protoChannels.empty() && !coeffs[i].empty())
+            {
+                cv::Mat mask = cv::Mat::zeros(protoH, protoW, CV_32F);
+                for (int k = 0; k < maskDim; ++k)
+                {
+                    mask += coeffs[i][k] * protoChannels[k];
+                }
+                mask = SigmoidMat(mask);
+
+                cv::Mat maskInput;
+                cv::resize(mask, maskInput, cv::Size(m_inputW, m_inputH), 0.0, 0.0, cv::INTER_LINEAR);
+                const cv::Rect cropRect(lb.padW, lb.padH, std::max(1, lb.resizedW), std::max(1, lb.resizedH));
+                cv::Mat maskCrop = maskInput(cropRect).clone();
+                cv::Mat maskOrig;
+                cv::resize(maskCrop, maskOrig, origSize, 0.0, 0.0, cv::INTER_LINEAR);
+                cv::Mat maskBin;
+                cv::threshold(maskOrig, maskBin, 0.5, 255.0, cv::THRESH_BINARY);
+                maskBin.convertTo(d.mask, CV_8U);
+            }
+            filtered.push_back(std::move(d));
         }
         return filtered;
     }

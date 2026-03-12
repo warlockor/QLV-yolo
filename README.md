@@ -189,10 +189,11 @@ make tflite_gpu \
   --output result_tflite_gpu.jpg
 ```
 
-## 模型格式与参数
+## 模型格式与参数（支持 YOLO-Seg）
 
-- 模型格式：`INT8 .tflite`（例如 `yolo26n_int8.tflite`）
+- 模型格式：`INT8/FP16/FP32 .tflite`（例如 `yolo26n-seg_armnn_int8.tflite`）
 - 当前后处理按常见 YOLO 输出假设：`[1, N, 4 + 1 + num_classes]`
+- 当前代码已支持 `yolo*-seg` 常见双输出（检测头 + mask proto），会在结果图叠加分割掩码。
 - 若导出布局不同，请按你的输出张量调整源码中的后处理解析。
 
 所有可执行程序使用相同参数：
@@ -267,6 +268,7 @@ python3 tools/eval_exported_models.py \
   --out-dir models \
   --stem yolo26n \
   --imgsz 640 \
+  --task segment \
   --split val \
   --device cpu \
   --batch 1 \
@@ -282,18 +284,18 @@ python3 tools/eval_exported_models.py \
   --tflite-cpu-model /abs/path/yolo26n_tflite_cpu_int8.tflite \
   --tflite-gpu-model /abs/path/yolo26n_tflite_gpu_fp16.tflite \
   --imgsz 640 \
+  --task segment \
   --split val \
   --device cpu
 ```
 
 ### 输出内容
 
-脚本会打印并可选保存以下指标：
+脚本会打印并可选保存以下指标（根据 `--task`）：
 
-- `mAP50`
-- `mAP50-95`
-- `precision`
-- `recall`
+- `box_mAP50`、`box_mAP50-95`
+- `seg_mAP50`、`seg_mAP50-95`（`--task segment` 时）
+- `box_precision/recall` 与 `seg_precision/recall`
 - `speed(ms)` 与估算 `FPS`
 
 用于快速验证：

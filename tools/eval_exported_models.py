@@ -27,9 +27,12 @@ def _require_ultralytics():
     return YOLO
 
 
-def _metric_get(metrics: Any, key: str) -> Optional[float]:
+def _metric_get(metrics: Any, head: str, key: str) -> Optional[float]:
     try:
-        value = getattr(metrics.box, key, None)
+        branch = getattr(metrics, head, None)
+        if branch is None:
+            return None
+        value = getattr(branch, key, None)
         if value is None:
             return None
         return float(value)
@@ -51,6 +54,7 @@ def evaluate_one(
     split: str,
     device: str,
     batch: int,
+    task: str,
 ) -> Dict[str, Any]:
     YOLO = _require_ultralytics()
 
@@ -66,6 +70,7 @@ def evaluate_one(
             imgsz=imgsz,
             batch=batch,
             device=device,
+            task=task,
             verbose=False,
         )
         elapsed = time.perf_counter() - start
@@ -74,10 +79,14 @@ def evaluate_one(
             "name": name,
             "model": str(model_path),
             "ok": True,
-            "mAP50": _metric_get(metrics, "map50"),
-            "mAP50-95": _metric_get(metrics, "map"),
-            "precision": _metric_get(metrics, "mp"),
-            "recall": _metric_get(metrics, "mr"),
+            "box_mAP50": _metric_get(metrics, "box", "map50"),
+            "box_mAP50-95": _metric_get(metrics, "box", "map"),
+            "box_precision": _metric_get(metrics, "box", "mp"),
+            "box_recall": _metric_get(metrics, "box", "mr"),
+            "seg_mAP50": _metric_get(metrics, "seg", "map50"),
+            "seg_mAP50-95": _metric_get(metrics, "seg", "map"),
+            "seg_precision": _metric_get(metrics, "seg", "mp"),
+            "seg_recall": _metric_get(metrics, "seg", "mr"),
             "fps_estimate": None,
             "val_seconds": elapsed,
         }
@@ -119,9 +128,9 @@ def auto_pick_models(out_dir: Path, stem: str) -> Dict[str, Path]:
 def print_table(results: list[Dict[str, Any]]) -> None:
     print("\n=== Exported Model Evaluation Summary ===")
     print(
-        f"{'Scheme':<14} {'Status':<8} {'mAP50':>8} {'mAP50-95':>10} {'Prec':>8} {'Recall':>8} {'FPS':>8}  Model"
+        f"{'Scheme':<14} {'Status':<8} {'box50':>8} {'box95':>8} {'seg50':>8} {'seg95':>8} {'FPS':>8}  Model"
     )
-    print("-" * 105)
+    print("-" * 110)
     for r in results:
         if not r.get("ok"):
             print(
@@ -131,10 +140,10 @@ def print_table(results: list[Dict[str, Any]]) -> None:
             continue
         print(
             f"{r['name']:<14} {'OK':<8} "
-            f"{_fmt(r.get('mAP50')):>8} "
-            f"{_fmt(r.get('mAP50-95')):>10} "
-            f"{_fmt(r.get('precision')):>8} "
-            f"{_fmt(r.get('recall')):>8} "
+            f"{_fmt(r.get('box_mAP50')):>8} "
+            f"{_fmt(r.get('box_mAP50-95')):>8} "
+            f"{_fmt(r.get('seg_mAP50')):>8} "
+            f"{_fmt(r.get('seg_mAP50-95')):>8} "
             f"{_fmt(r.get('fps_estimate'), 2):>8}  "
             f"{r['model']}"
         )
@@ -152,6 +161,12 @@ def main() -> int:
     parser.add_argument("--split", default="val", help="Dataset split: val/test/train")
     parser.add_argument("--device", default="cpu", help="Ultralytics device, e.g. cpu or 0")
     parser.add_argument("--batch", type=int, default=1, help="Validation batch size")
+    parser.add_argument(
+        "--task",
+        default="segment",
+        choices=["segment", "detect"],
+        help="Validation task type. Use 'segment' for yolo*-seg models.",
+    )
 
     parser.add_argument(
         "--out-dir",
@@ -199,12 +214,12 @@ def main() -> int:
         )
 
     results = [
-        evaluate_one("armnn", resolved["armnn"], data_yaml, args.imgsz, args.split, args.device, args.batch),
+        evaluate_one("armnn", resolved["armnn"], data_yaml, args.imgsz, args.split, args.device, args.batch, args.task),
         evaluate_one(
-            "tflite_cpu", resolved["tflite_cpu"], data_yaml, args.imgsz, args.split, args.device, args.batch
+            "tflite_cpu", resolved["tflite_cpu"], data_yaml, args.imgsz, args.split, args.device, args.batch, args.task
         ),
         evaluate_one(
-            "tflite_gpu", resolved["tflite_gpu"], data_yaml, args.imgsz, args.split, args.device, args.batch
+            "tflite_gpu", resolved["tflite_gpu"], data_yaml, args.imgsz, args.split, args.device, args.batch, args.task
         ),
     ]
 
