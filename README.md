@@ -23,7 +23,7 @@
 
 ```bash
 sudo apt update
-   \
+sudo apt install -y \
   build-essential make pkg-config git \
   libopencv-dev \
   ocl-icd-opencl-dev opencl-headers clinfo \
@@ -203,6 +203,42 @@ make tflite_gpu \
 - `--classes`：类别数（默认 `80`）
 - `--conf`：置信度阈值（默认 `0.25`）
 - `--iou`：NMS IoU 阈值（默认 `0.45`）
+
+## 从 `.pt` 导出三种方案可读模型
+
+本仓库提供脚本：`tools/export_ultralytics_pt.py`  
+输入 Ultralytics `.pt`，自动导出三种方案可直接使用的模型文件：
+
+- 方案一（Arm NN）：`*_armnn_int8.tflite`
+- 方案二（TFLite CPU）：`*_tflite_cpu_int8.tflite`
+- 方案三（TFLite GPU Delegate）：`*_tflite_gpu_fp16.tflite`（若 FP16 失败自动回退 `*_tflite_gpu_fp32.tflite`）
+
+### 导出脚本依赖（Python）
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install ultralytics tensorflow
+```
+
+> 说明：不同 Ultralytics/TensorFlow 版本对 TFLite 导出依赖略有差异，若提示缺包，请按报错补装相关包。
+
+### 使用方式
+
+```bash
+python3 tools/export_ultralytics_pt.py \
+  --pt /path/to/yolo26n.pt \
+  --out-dir models \
+  --imgsz 640 \
+  --data /path/to/dataset.yaml
+```
+
+参数说明：
+
+- `--pt`：输入 `.pt` 模型路径
+- `--out-dir`：导出目录（默认 `models`）
+- `--imgsz`：导出推理尺寸（默认 `640`）
+- `--data`：INT8 校准数据配置（建议提供，提升量化质量）
+- `--device`：可选，导出设备（如 `cpu`）
 
 ## 常用 Make 命令
 
